@@ -1,0 +1,8 @@
+node_modules/
+coverage/
+.env
+dist/
+build/
+test_output.txt
+*.log
+.DS_Store
