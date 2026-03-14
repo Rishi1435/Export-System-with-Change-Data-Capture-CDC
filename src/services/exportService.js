@@ -1,10 +1,10 @@
 const { pool } = require('../db');
 const { logger } = require('../logger');
-const { createWriteStream } = require('fs');
-const { stringify } = require('csv-stringify');
+const fs = require('fs');
 const path = require('path');
 
 const OUTPUT_DIR = path.join(process.cwd(), 'output');
+const BATCH_SIZE = 10000;
 
 class ExportService {
 
@@ -31,6 +31,16 @@ class ExportService {
         return this.executeExport(jobId, consumerId, outputFilename, 'delta');
     }
 
+    formatCsvValue(val) {
+        if (val === null || val === undefined) return '';
+        if (val instanceof Date) return val.toISOString();
+        const str = String(val);
+        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+            return '"' + str.replace(/"/g, '""') + '"';
+        }
+        return str;
+    }
+
     async executeExport(jobId, consumerId, outputFilename, exportType) {
         const startTime = Date.now();
         logger.info({ jobId, consumerId, exportType }, 'Export job started');
@@ -44,32 +54,35 @@ class ExportService {
         }
 
         try {
-            const lastExportedAt = await this.getWatermark(consumerId);
+            // Fetch watermark using the acquired client
+            const wmResult = await client.query(
+                'SELECT last_exported_at FROM watermarks WHERE consumer_id = $1',
+                [consumerId]
+            );
+            const lastExportedAt = wmResult.rows.length > 0 ? wmResult.rows[0].last_exported_at : null;
 
             let baseQuery = '';
             let queryParams = [];
 
             switch (exportType) {
                 case 'full':
-                    baseQuery = 'SELECT *, id as numeric_id FROM users WHERE is_deleted = FALSE';
+                    baseQuery = 'SELECT id, name, email, created_at, updated_at, is_deleted FROM users WHERE is_deleted = FALSE';
                     break;
                 case 'incremental':
-                    baseQuery = 'SELECT *, id as numeric_id FROM users WHERE is_deleted = FALSE';
+                    baseQuery = 'SELECT id, name, email, created_at, updated_at, is_deleted FROM users WHERE is_deleted = FALSE';
                     if (lastExportedAt) {
                         baseQuery += ' AND updated_at > $1';
                         queryParams.push(lastExportedAt);
                     }
                     break;
                 case 'delta':
-                    baseQuery = `
-            SELECT *, id as numeric_id,
-              CASE
-                WHEN is_deleted = TRUE THEN 'DELETE'
-                WHEN created_at >= updated_at THEN 'INSERT'
-                ELSE 'UPDATE'
-              END as operation
-            FROM users 
-          `;
+                    baseQuery = `SELECT id, name, email, created_at, updated_at, is_deleted,
+                        CASE
+                            WHEN is_deleted = TRUE THEN 'DELETE'
+                            WHEN created_at >= updated_at THEN 'INSERT'
+                            ELSE 'UPDATE'
+                        END as operation
+                        FROM users`;
                     if (lastExportedAt) {
                         baseQuery += ' WHERE updated_at > $1';
                         queryParams.push(lastExportedAt);
@@ -77,86 +90,58 @@ class ExportService {
                     break;
             }
 
+            baseQuery += ' ORDER BY updated_at ASC, id ASC';
+
             const filePath = path.join(OUTPUT_DIR, outputFilename);
-            const writeStream = createWriteStream(filePath);
 
             const columns = exportType === 'delta'
                 ? ['operation', 'id', 'name', 'email', 'created_at', 'updated_at', 'is_deleted']
                 : ['id', 'name', 'email', 'created_at', 'updated_at', 'is_deleted'];
 
-            const stringifier = stringify({ header: true, columns, cast: { date: (value) => value.toISOString() } });
-            stringifier.pipe(writeStream);
+            // Write CSV header
+            fs.writeFileSync(filePath, columns.join(',') + '\n');
 
-            let lastUpdatedAtPaging = null;
-            let lastIdPaging = null;
+            let offset = 0;
             let hasMore = true;
             let rowsExported = 0;
             let maxUpdatedAt = null;
 
             while (hasMore) {
-                let chunkQuery = baseQuery;
-                let chunkParams = [...queryParams];
-
-                // Add cursor conditions
-                if (lastUpdatedAtPaging && lastIdPaging) {
-                    if (chunkParams.length === 0) {
-                        chunkQuery += ' WHERE';
-                    } else {
-                        if (exportType === 'full' || exportType === 'incremental') {
-                            chunkQuery += ' AND';
-                        } else {
-                            if (!baseQuery.includes('WHERE')) {
-                                chunkQuery += ' WHERE';
-                            } else {
-                                chunkQuery += ' AND';
-                            }
-                        }
-                    }
-                    chunkQuery += ` (updated_at > $${chunkParams.length + 1} OR (updated_at = $${chunkParams.length + 1} AND id > $${chunkParams.length + 2}))`;
-                    chunkParams.push(lastUpdatedAtPaging, lastIdPaging);
-                }
-
-                chunkQuery += ' ORDER BY updated_at ASC, id ASC LIMIT 10000';
-
-                const result = await client.query(chunkQuery, chunkParams);
+                const paginatedQuery = `${baseQuery} LIMIT ${BATCH_SIZE} OFFSET ${offset}`;
+                const result = await client.query(paginatedQuery, queryParams);
                 const rows = result.rows;
 
                 if (rows.length === 0) {
                     hasMore = false;
                 } else {
+                    let csvChunk = '';
                     for (const row of rows) {
-                        const outRow = {};
-                        for (const col of columns) {
-                            outRow[col] = row[col];
-                        }
-                        stringifier.write(outRow);
+                        const line = columns.map(col => this.formatCsvValue(row[col])).join(',');
+                        csvChunk += line + '\n';
 
                         if (!maxUpdatedAt || row.updated_at > maxUpdatedAt) {
                             maxUpdatedAt = row.updated_at;
                         }
                     }
+                    fs.appendFileSync(filePath, csvChunk);
 
                     rowsExported += rows.length;
-                    lastUpdatedAtPaging = rows[rows.length - 1].updated_at;
-                    lastIdPaging = rows[rows.length - 1].numeric_id;
+                    offset += rows.length;
+
+                    if (rows.length < BATCH_SIZE) {
+                        hasMore = false;
+                    }
                 }
             }
-
-            stringifier.end();
-
-            await new Promise((resolve, reject) => {
-                writeStream.on('finish', () => resolve());
-                writeStream.on('error', reject);
-            });
 
             // Transactionally update the watermark
             if (maxUpdatedAt) {
                 await client.query('BEGIN');
                 await client.query(
                     `INSERT INTO watermarks (consumer_id, last_exported_at, updated_at) 
-           VALUES ($1, $2, NOW()) 
-           ON CONFLICT (consumer_id) 
-           DO UPDATE SET last_exported_at = EXCLUDED.last_exported_at, updated_at = NOW()`,
+                     VALUES ($1, $2, NOW()) 
+                     ON CONFLICT (consumer_id) 
+                     DO UPDATE SET last_exported_at = EXCLUDED.last_exported_at, updated_at = NOW()`,
                     [consumerId, maxUpdatedAt]
                 );
                 await client.query('COMMIT');

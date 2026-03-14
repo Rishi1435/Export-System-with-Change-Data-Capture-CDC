@@ -6,3 +6,4 @@ build/
 test_output.txt
 *.log
 .DS_Store
+output/

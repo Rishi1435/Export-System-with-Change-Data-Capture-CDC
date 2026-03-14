@@ -26,9 +26,9 @@ BEGIN
         INSERT INTO users (name, email, created_at, updated_at, is_deleted)
         SELECT 
             'User ' || i,
-            'user' || i || '_' || encode(gen_random_bytes(4), 'hex') || '@example.com',
-            NOW() - ((random() * 7 + 1) || ' days')::interval,
-            NOW() - ((random() * 7) || ' days')::interval,
+            'user' || i || '_' || substring(md5(random()::text) from 1 for 8) || '@example.com',
+            NOW() - (random() * interval '7 days' + interval '1 day'),
+            NOW() - (random() * interval '7 days'),
             random() < 0.015
         FROM generate_series(1, 100000) AS i;
         
