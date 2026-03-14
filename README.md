@@ -2,6 +2,9 @@
 
 A production-ready, containerized backend API with a PostgreSQL database that streams large datasets asynchronously.
 
+## Video Presentation
+[Watch the Code Walkthrough on YouTube](https://youtu.be/xeuH-tKQoJI)
+
 ## Features
 - Background execution of exports (full, incremental, delta).
 - Robust pagination streaming data cleanly out of massive Postgres datasets.
